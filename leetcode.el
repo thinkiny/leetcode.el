@@ -430,7 +430,7 @@ VALUE should be the referer."
 
 (defun leetcode--cookie-get (cookie-key)
   "Get LeetCode cookie value by COOKIE-KEY."
-  (if-let ((cookie (seq-find
+  (if-let* ((cookie (seq-find
                     (lambda (item)
                       (string= (aref item 1) cookie-key))
                     (url-cookie-retrieve leetcode--domain "/" t))))
@@ -563,9 +563,15 @@ GraphQL request is defined with 'leetcode--graphql-<QUERY-NAME>'.
 In the GraqhQL request body, operation name is lower camel case
 of QUERY-NAME."
   (declare (indent defun) (doc-string 3))
-  (let ((variables (mapcar (lambda (arg) `(cons (s-lower-camel-case (symbol-name ',arg)) ,arg)) args)))
+  ;; `s-lower-camel-case' splits on `[:word:]', which is syntax-table
+  ;; dependent; pin the standard syntax table so loading in a buffer where
+  ;; `-' has word syntax doesn't corrupt the operation name.
+  (let* ((camel (lambda (sym)
+                  (with-syntax-table (standard-syntax-table)
+                    (s-lower-camel-case (symbol-name sym)))))
+         (variables (mapcar (lambda (arg) `(cons ,(funcall camel arg) ,arg)) args)))
     `(aio-defun ,(intern (concat "leetcode--fetch-" (symbol-name query-name))) ,args
-       (let* ((graphql-operation-name ,(s-lower-camel-case (symbol-name query-name)))
+       (let* ((graphql-operation-name ,(funcall camel query-name))
               (graphql-body ,(intern (concat "leetcode--graphql-" (symbol-name query-name))))
               (payload (leetcode--graphql-payload graphql-operation-name
                                                   graphql-body
@@ -576,7 +582,7 @@ of QUERY-NAME."
               (response (aio-await (aio-url-retrieve leetcode--url-graphql)))
               (response-status (car response))
               (response-buffer (cdr response)))
-         (if-let ((error (plist-get response-status :error)))
+         (if-let* ((error (plist-get response-status :error)))
              (progn
                (switch-to-buffer response-buffer))
            (let-alist (with-current-buffer response-buffer (goto-char url-http-end-of-headers) (json-read))
@@ -705,7 +711,7 @@ of QUERY-NAME."
          (response (aio-await (aio-url-retrieve (format leetcode--url-try title-slug))))
          (response-status (car response))
          (response-buffer (cdr response)))
-    (if-let ((error-info (plist-get response-status :error)))
+    (if-let* ((error-info (plist-get response-status :error)))
         (progn
           (switch-to-buffer response-buffer)
           (leetcode--warn "LeetCode interpret problem ERROR: %S" error-info))
@@ -732,22 +738,32 @@ submission status."
   (message "LeetCode check submission: %s" (format leetcode--url-check-submission interpret-id))
   (let* ((title-slug (leetcode-problem-title-slug problem))
          (problem-id (leetcode-problem-id problem))
-         (url-request-method "GET")
-         (url-request-extra-headers `(,@(aio-await (leetcode--common-extra-headers))
-                                      ,(leetcode--referer (format leetcode--url-problems title-slug))))
-         (response (aio-await (aio-url-retrieve (format leetcode--url-check-submission interpret-id))))
-         (response-status (car response))
-         (response-buffer (cdr response)))
-    (if-let ((error-info (plist-get response-status :error)))
-        (progn
-          (switch-to-buffer response-buffer)
-          (leetcode--warn "LeetCode check submission ERROR: %S" error-info))
-      (let ((result (leetcode--parse-buffer response-buffer)))
-        (let-alist result
-          (pcase .state
-            ((or "PENDING" "STARTED") ((aio-await (aio-sleep 0.2))
-                                       (aio-await (leetcode--api-check-submission interpret-id problem on-success))))
-            ("SUCCESS" (funcall on-success problem-id result))))))))
+         (max-retries 50)                    ; 50 polls x 0.2s sleep + request latency
+         (retry-times 0)
+         (result nil))
+    (while (and (not (equal (alist-get 'state result) "SUCCESS"))
+                (< retry-times max-retries))
+      (let* ((url-request-method "GET")
+             (url-request-extra-headers `(,@(aio-await (leetcode--common-extra-headers))
+                                          ,(leetcode--referer (format leetcode--url-problems title-slug))))
+             (response (aio-await (aio-url-retrieve (format leetcode--url-check-submission interpret-id))))
+             (response-status (car response))
+             (response-buffer (cdr response)))
+        (if (plist-get response-status :error)
+            (progn
+              (switch-to-buffer response-buffer)
+              (leetcode--warn "LeetCode check submission ERROR: %S"
+                              (plist-get response-status :error))
+              (setq retry-times max-retries))
+          (setq result (condition-case nil
+                           (leetcode--parse-buffer response-buffer)
+                         (error result)))
+          (kill-buffer response-buffer)))
+      (aio-await (aio-sleep 0.2))
+      (setq retry-times (1+ retry-times)))
+    (if (equal (alist-get 'state result) "SUCCESS")
+        (funcall on-success problem-id result)
+      (leetcode--warn "LeetCode check submission timeout."))))
 
 
 (aio-defun leetcode--login ()
@@ -1002,7 +1018,7 @@ row."
          (response (aio-await (leetcode--api-submit backend-id slug-title code)))
          (response-status (car response))
          (response-buffer (cdr response)))
-    (if-let ((error-info (plist-get response-status :error)))
+    (if-let* ((error-info (plist-get response-status :error)))
         (switch-to-buffer response-buffer)
       (let* ((resp (leetcode--parse-buffer response-buffer))
              (submission-id (number-to-string (alist-get 'submission_id resp))))
