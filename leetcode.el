@@ -171,6 +171,13 @@ page range.")
   :group 'leetcode
   :type 'directory)
 
+(defcustom leetcode-cache-file (file-name-concat user-emacs-directory "leetcode-problems-cache.json")
+  "File caching the problem list between sessions.
+Metadata only (id/title/slug/status/acceptance/difficulty/paid/tags);
+problem content, snippets and testcases are always fetched live."
+  :group 'leetcode
+  :type 'file)
+
 (cl-defstruct leetcode-user
   "A LeetCode User.
 The object with following attributes:
@@ -235,7 +242,7 @@ in 'leetcode.el'."
 (defvar leetcode--problem-titles nil
   "Problem titles that have been open in solving layout.")
 
-(defvar leetcode--problem-id nil
+(defvar-local leetcode--problem-id nil
   "Buffer-local problem id in a LeetCode code buffer.")
 
 (defvar leetcode--display-tags leetcode-prefer-tag-display
@@ -684,6 +691,73 @@ of `leetcode-problem' in response order."
   ;; not corrupt the problem list's pagination state.
   (leetcode--parse-question-list-page .data.problemsetQuestionListV2))
 
+(defun leetcode--problem-to-cache-alist (problem)
+  "Serialize PROBLEM's list metadata to an alist for the cache file."
+  `((status . ,(leetcode-problem-status problem))
+    (id . ,(leetcode-problem-id problem))
+    (title . ,(leetcode-problem-title problem))
+    (titleSlug . ,(leetcode-problem-title-slug problem))
+    (acceptance . ,(leetcode-problem-acceptance problem))
+    (difficulty . ,(leetcode-problem-difficulty problem))
+    (paidOnly . ,(leetcode-problem-paid-only problem))
+    (tags . ,(vconcat (leetcode-problem-tags problem)))))
+
+(defun leetcode--cache-alist-to-problem (entry)
+  "Rebuild a `leetcode-problem' from a cache ENTRY alist."
+  (let-alist entry
+    (make-leetcode-problem
+     :status .status
+     :id .id
+     :title .title
+     :title-slug .titleSlug
+     :acceptance .acceptance
+     :difficulty .difficulty
+     :paid-only .paidOnly
+     :tags (append .tags '()))))
+
+(defun leetcode--save-problems-cache ()
+  "Write the current problem list to `leetcode-cache-file'.
+Deduplicated by problem id, keeping the first occurrence."
+  (when leetcode-cache-file
+    (let* ((problems (leetcode-problems-problems leetcode--problems))
+           (seen ())
+           (deduped (seq-filter (lambda (p)
+                                  (let ((id (leetcode-problem-id p)))
+                                    (if (member id seen)
+                                        nil
+                                      (push id seen) t)))
+                                problems)))
+      (with-temp-file leetcode-cache-file
+        (insert (json-encode
+                 `((version . 1)
+                   (hasMore . ,(leetcode-problems-has-more leetcode--problems))
+                   (problems . ,(vconcat
+                                 (mapcar #'leetcode--problem-to-cache-alist
+                                         deduped))))))))))
+
+(defun leetcode--load-problems-cache ()
+  "Populate `leetcode--problems' from `leetcode-cache-file'.
+Return t when the cache was usable, nil on missing/corrupt/old-version
+files."
+  (when (and leetcode-cache-file (file-exists-p leetcode-cache-file))
+    (condition-case nil
+        (let-alist (with-temp-buffer
+                     (insert-file-contents leetcode-cache-file)
+                     (goto-char (point-min))
+                     (json-read))
+          (when (eq .version 1)
+            (let ((problems (mapcar #'leetcode--cache-alist-to-problem
+                                    (append .problems '()))))
+              (setf (leetcode-problems-problems leetcode--problems) problems
+                    (leetcode-problems-num leetcode--problems) (length problems)
+                    (leetcode-problems-tag leetcode--problems) "all"
+                    (leetcode-problems-has-more leetcode--problems) .hasMore)
+              (setq leetcode--all-tags
+                    (delete-dups
+                     (apply #'append (mapcar #'leetcode-problem-tags problems))))
+              t)))
+      (error nil))))
+
 (leetcode--define-graphql question-content (title-slug)
   (let ((problem (leetcode--get-problem title-slug)))
     (if problem
@@ -1015,6 +1089,7 @@ row."
                                             ""
                                             '((sortField . "CUSTOM")
                                               (sortOrder . "ASCENDING"))))
+  (leetcode--save-problems-cache)
   (leetcode-refresh))
 
 (defvar leetcode--load-more-button-fn
@@ -1057,19 +1132,21 @@ row."
       (tabulated-list-print t))))
 
 (aio-defun leetcode-refresh-fetch ()
-  "Refresh problems and update `tabulated-list-entries'."
+  "Refresh problems and update `tabulated-list-entries'.
+Fetch one more page on top of the loaded problems, so the list grows
+a page per refresh."
   (interactive)
   (message "LeetCode refreshing question list...")
-  (setf (leetcode-problems-problems leetcode--problems) nil
-        (leetcode-problems-num leetcode--problems) 0
-        (leetcode-problems-has-more leetcode--problems) t)
+  (setf (leetcode-problems-has-more leetcode--problems) t)
   ;; max page limit is 100
   (aio-await (leetcode--fetch-question-list "all-code-essentials"
-                                            0 100
+                                            (leetcode-problems-num leetcode--problems)
+                                            100
                                             '((filterCombineType . "ALL"))
                                             ""
                                             '((sortField . "CUSTOM")
-                                              (sortOrder . "ASCENDING")))) ; TODO pagination?
+                                              (sortOrder . "ASCENDING"))))
+  (leetcode--save-problems-cache)
   (setq leetcode--display-tags leetcode-prefer-tag-display)
   (leetcode-reset-filter-and-refresh))
 
@@ -1086,8 +1163,10 @@ row."
     (if (get-buffer leetcode--buffer-name)
         (switch-to-buffer leetcode--buffer-name)
       (aio-await (leetcode--ensure-login))
-      (aio-await (leetcode-refresh-fetch))
-      (switch-to-buffer leetcode--buffer-name))
+      (unless (leetcode--load-problems-cache)
+        (aio-await (leetcode-refresh-fetch)))
+      (switch-to-buffer leetcode--buffer-name)
+      (leetcode-refresh))
     (leetcode--maybe-focus)))
 
 ;;;###autoload(autoload 'leetcode-daily "leetcode" nil t)
@@ -1120,6 +1199,30 @@ totalLength and return the page's problems."
                                                           (sortOrder . "ASCENDING"))))))
     (setq leetcode--random-total-problems (cdr page))
     (car page)))
+
+(aio-defun leetcode--fetch-question-by-id (problem-id)
+  "Fetch the problem with frontend id PROBLEM-ID and register it in
+`leetcode--problems'.  For problems not in the loaded list, e.g. an
+id typed into `leetcode-show-problem'.  A numeric search keyword
+matches the frontend id; the page is then exact-matched to skip
+number-bearing titles.  Return the problem, or `user-error' when the
+id matches nothing."
+  (let* ((page (aio-await (leetcode--fetch-question-page "all-code-essentials"
+                                                         0 5
+                                                         '((filterCombineType . "ALL"))
+                                                         problem-id
+                                                         '((sortField . "CUSTOM")
+                                                           (sortOrder . "ASCENDING")))))
+         (problem (seq-find (lambda (p) (equal (leetcode-problem-id p) problem-id))
+                            (car page))))
+    (if problem
+        (progn
+          (cl-pushnew problem (leetcode-problems-problems leetcode--problems)
+                      :test (lambda (a b) (equal (leetcode-problem-id a)
+                                                 (leetcode-problem-id b))))
+          (leetcode--save-problems-cache)
+          problem)
+      (user-error "LeetCode problem not found: %s" problem-id))))
 
 (aio-defun leetcode--random-pick (difficulty status tags)
   "Return a random problem matching DIFFICULTY, STATUS and TAGS, or nil.
@@ -1178,8 +1281,8 @@ selected; the problem description is not shown."
       ;; Downstream lookups (`leetcode--get-problem-by-id') require the
       ;; problem to be registered in `leetcode--problems'.
       (cl-pushnew pick (leetcode-problems-problems leetcode--problems)
-                  :test (lambda (a b) (equal (leetcode-problem-title-slug a)
-                                             (leetcode-problem-title-slug b))))
+                  :test (lambda (a b) (equal (leetcode-problem-id a)
+                                             (leetcode-problem-id b))))
       (let ((problem-id (leetcode-problem-id pick)))
         (leetcode--cleanup-other-problems problem-id)
         (leetcode-show-problem problem-id)))))
@@ -1446,9 +1549,9 @@ Get problem by id and use `shr-render-buffer' to render problem
 detail. This action will show the detail in other window and jump
 to it."
   (interactive (list (read-string "Show problem by problem id: "
-                                  (when (derived-mode-p 'leetcode--problems-mode)
-                                    (leetcode--get-current-problem-id)))))
-  (let* ((problem (leetcode--get-problem-by-id problem-id))
+                                  (leetcode--get-current-problem-id))))
+  (let* ((problem (or (leetcode--get-problem-by-id problem-id)
+                      (aio-await (leetcode--fetch-question-by-id problem-id))))
          (problem-with-title (aio-await (leetcode--ensure-question-title problem)))
          (problem-with-content (aio-await (leetcode--ensure-question-content problem)))
          (problem-with-testcases (aio-await (leetcode--ensure-question-testcases problem)))
@@ -1463,7 +1566,7 @@ This function will work after first run
 show the detail in other window and jump to it.
 
 It can be used in org-link elisp:(leetcode-show-problem-by-slug \"3sum\")."
-  (interactive (list (read-number "Show problem by problem id: "
+  (interactive (list (read-string "Show problem by problem id: "
                                   (leetcode--get-current-problem-id))))
   (let* ((problem (leetcode--get-problem slug-title))
          (problem-id (leetcode-problem-id problem)))
@@ -1632,8 +1735,10 @@ problem from `leetcode--problem-titles'."
     (leetcode-problem-id problem)))
 
 (defun leetcode--get-current-problem-id ()
-  "Get id of the current problem."
-  (aref (tabulated-list-get-entry) 1))
+  "Get id of the current problem, or nil outside the problems list."
+  (if (derived-mode-p 'leetcode--problems-mode)
+      (aref (tabulated-list-get-entry) 1)
+    leetcode--problem-id))
 
 (defun leetcode--start-coding (problem)
   "Create a buffer for coding PROBLEM.
@@ -1806,7 +1911,8 @@ It will restore the layout based on current buffer's problem id."
       (define-key map (kbd "C-c C-t") #'leetcode-try)
       (define-key map (kbd "C-c C-s") #'leetcode-submit)
       (define-key map (kbd "C-c C-r") #'leetcode-random)
-      (define-key map (kbd "C-c C-l") #'leetcode-restore-layout)))
+      (define-key map (kbd "C-c C-l") #'leetcode-restore-layout)
+      (define-key map (kbd "C-c C-o") #'leetcode-show-problem-in-browser)))
   "Keymap for `leetcode-solution-mode'.")
 
 (define-minor-mode leetcode-solution-mode
