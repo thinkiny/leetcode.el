@@ -128,6 +128,39 @@ mysql, mssql, oraclesql."
   :group 'leetcode
   :type 'boolean)
 
+(defcustom leetcode-buffer-header
+  '(("golang" . "package main\n\n"))
+  "Alist mapping LeetCode langSlug to header text prepended to a fresh solve buffer.
+
+The header is inserted once, at the top of the buffer, only when the buffer
+is empty (first open of a problem).  Reopen under `leetcode-save-solutions'
+skips re-insertion since the buffer is non-empty, so there is no duplication.
+
+LeetCode strips common headers (e.g. `package main') server-side on
+submit/try, so no client-side stripping is performed on send."
+  :group 'leetcode
+  :type '(alist :key-type string :value-type string))
+
+(defcustom leetcode-random-filter '("medium" "all" nil)
+  "Last used `leetcode-random' filter, as (DIFFICULTY STATUS TAGS).
+DIFFICULTY is \"easy\"/\"medium\"/\"hard\"/\"all\", STATUS is
+\"unsolved\"/\"all\", TAGS is a list of tag strings or nil.
+
+Persisted through Customize so the previous filter is reused on
+next Emacs start."
+  :group 'leetcode
+  :type '(list (string :tag "Difficulty")
+               (string :tag "Status")
+               (repeat string)))
+
+(defvar leetcode--random-total-problems 4200
+  "Initial guess of the total LeetCode problem count, updated from
+the first random fetch's totalLength and used to derive the random
+page range.")
+
+(defvar leetcode--random-page-size 25
+  "Number of problems per random page fetch.")
+
 (defcustom leetcode-focus t
   "When execute `leetcode', always delete other windows."
   :group 'leetcode
@@ -202,11 +235,17 @@ in 'leetcode.el'."
 (defvar leetcode--problem-titles nil
   "Problem titles that have been open in solving layout.")
 
+(defvar leetcode--problem-id nil
+  "Buffer-local problem id in a LeetCode code buffer.")
+
 (defvar leetcode--display-tags leetcode-prefer-tag-display
   "(Internal) Whether tags are displayed the *leetcode* buffer.")
 
-(defvar leetcode--display-paid nil
-  "(Internal) Whether paid problems are displayed the *leetcode* buffer.")
+(defcustom leetcode-display-paid nil
+  "Whether paid problems are displayed in the *leetcode* buffer.
+Also gates `leetcode-random': when nil, random picks free problems only."
+  :group 'leetcode
+  :type 'boolean)
 
 (defvar leetcode--lang leetcode-prefer-language
   "LeetCode programming language or sql for current problem internally.
@@ -358,6 +397,14 @@ query problemsetQuestionListV2($filters: QuestionFilterInput, $limit: Int, $sear
   }
 }")
 
+(defconst leetcode--graphql-question-page
+  ;; The list query with a distinct operation name; the root field must
+  ;; stay `problemsetQuestionListV2' — only the operation declaration is
+  ;; renamed (operationName must match a declaration in the document).
+  (string-replace "query problemsetQuestionListV2("
+                  "query questionPage("
+                  leetcode--graphql-problemset-question-list-v2))
+
 (defconst leetcode--graphql-question-title "
 query questionTitle($titleSlug: String!) {
   question(titleSlug: $titleSlug) { questionId questionFrontendId title titleSlug
@@ -431,9 +478,9 @@ VALUE should be the referer."
 (defun leetcode--cookie-get (cookie-key)
   "Get LeetCode cookie value by COOKIE-KEY."
   (if-let* ((cookie (seq-find
-                    (lambda (item)
-                      (string= (aref item 1) cookie-key))
-                    (url-cookie-retrieve leetcode--domain "/" t))))
+                     (lambda (item)
+                       (string= (aref item 1) cookie-key))
+                     (url-cookie-retrieve leetcode--domain "/" t))))
       (aref cookie 2)))
 
 (defun leetcode--maybe-csrf-token ()
@@ -515,7 +562,7 @@ Such as 'Two Sum' will be converted to 'two-sum'. 'Pow(x, n)' will be 'powx-n'"
 (aio-defun leetcode--common-extra-headers ()
   "Common extra headers for `url-request-extra-headers'."
   `(,leetcode--User-Agent ,leetcode--Content-Type
-    ,(cons leetcode--X-CSRFToken (aio-await (leetcode--csrf-token)))))
+                          ,(cons leetcode--X-CSRFToken (aio-await (leetcode--csrf-token)))))
 
 (defun leetcode--buffer-content (buf)
   "Get content without text properties of BUF."
@@ -523,9 +570,19 @@ Such as 'Two Sum' will be converted to 'two-sum'. 'Pow(x, n)' will be 'powx-n'"
     (buffer-substring-no-properties
      (point-min) (point-max))))
 
+(defun leetcode--format-testcase-with-number (testcase number)
+  "Return TESTCASE prefixed with a \"case NUMBER: \" label line."
+  (concat "case " (number-to-string number) ":\n" testcase))
+
 (defun leetcode--testcase-buffer-data (problem-id)
-  "Get testcases buffer content of PROBLEM-ID."
-  (leetcode--buffer-content (get-buffer (leetcode--testcase-buffer-name problem-id))))
+  "Get testcases buffer content of PROBLEM-ID as one argument per line.
+Case-number label lines (\"case N:\") added on fill are stripped."
+  (string-join
+   (seq-remove (lambda (line) (string-match-p "\\`case [0-9]+:*\\'" line))
+               (split-string
+                (leetcode--buffer-content (get-buffer (leetcode--testcase-buffer-name problem-id)))
+                "\n" t))
+   "\n"))
 
 (defun leetcode--code-buffer-data ()
   "Get code buffer content, that is, the `current-buffer'."
@@ -535,15 +592,7 @@ Such as 'Two Sum' will be converted to 'two-sum'. 'Pow(x, n)' will be 'powx-n'"
         (match-string 1 code)
       code)))
 
-(defun leetcode--get-slug-title (code-buf)
-  "Get slug title before try or submit with CODE-BUF.
-LeetCode require slug-title as the request parameters."
-  (with-current-buffer code-buf
-    (if leetcode-save-solutions
-        (file-name-base (cadr (s-split "_" (buffer-name))))
-      (file-name-base (buffer-name)))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; LeetCode API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; LeetCode API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun leetcode--graphql-payload (operation query &optional vars)
   "Construct GraphQL request payload with OPERATION, QUERY or maybe VARS."
@@ -593,13 +642,14 @@ of QUERY-NAME."
   (setf (leetcode-user-username leetcode--user) .data.userStatus.username)
   (setf (leetcode-user-is-premium leetcode--user) .data.userStatus.isPremium))
 
-(leetcode--define-graphql problemset-question-list-v2 (category-slug skip limit filters search-keyword sort-by)
+(defun leetcode--parse-question-list-page (data)
+  "Parse DATA, the `problemsetQuestionListV2' response alist.
+Return (PROBLEMS . TOTAL-LENGTH), where PROBLEMS is a fresh list
+of `leetcode-problem' in response order."
   (let ((problems)
-        (page-problems-len (length .data.problemsetQuestionListV2.questions)))
-    (leetcode--debug "length: %s, total: %s" page-problems-len .data.problemsetQuestionListV2.totalLength)
-    (dotimes (i page-problems-len)
-      (leetcode--debug "i: %s, p: %s" i (aref .data.problemsetQuestionListV2.questions i))
-      (let-alist (aref .data.problemsetQuestionListV2.questions i)
+        (questions (cdr (assq 'questions data))))
+    (dotimes (i (length questions))
+      (let-alist (aref questions i)
         (push (make-leetcode-problem
                :status     .status
                :id         .questionFrontendId
@@ -612,14 +662,27 @@ of QUERY-NAME."
                                          (let-alist tag
                                            (push .slug tags)))
                                        .topicTags '()))
-              problems)
-        (setq leetcode--all-tags (append leetcode--all-tags (leetcode-problem-tags (car problems))))))
-    (setf (leetcode-problems-problems leetcode--problems) (append (leetcode-problems-problems leetcode--problems) (nreverse problems))
+              problems)))
+    (cons (nreverse problems) (cdr (assq 'totalLength data)))))
+
+(leetcode--define-graphql problemset-question-list-v2 (category-slug skip limit filters search-keyword sort-by)
+  (let* ((page (leetcode--parse-question-list-page .data.problemsetQuestionListV2))
+         (problems (car page))
+         (page-problems-len (length problems)))
+    (leetcode--debug "length: %s, total: %s" page-problems-len (cdr page))
+    (dolist (problem problems)
+      (setq leetcode--all-tags (append leetcode--all-tags (leetcode-problem-tags problem))))
+    (setf (leetcode-problems-problems leetcode--problems) (append (leetcode-problems-problems leetcode--problems) problems)
           (leetcode-problems-num leetcode--problems) (+ (leetcode-problems-num leetcode--problems) page-problems-len)
           (leetcode-problems-tag leetcode--problems) "all"
           (leetcode-problems-has-more leetcode--problems) .data.problemsetQuestionListV2.hasMore)
     ;; problem tags
     (delete-dups leetcode--all-tags)))
+
+(leetcode--define-graphql question-page (category-slug skip limit filters search-keyword sort-by)
+  ;; Non-mutating twin of `problemset-question-list-v2': random pages must
+  ;; not corrupt the problem list's pagination state.
+  (leetcode--parse-question-list-page .data.problemsetQuestionListV2))
 
 (leetcode--define-graphql question-content (title-slug)
   (let ((problem (leetcode--get-problem title-slug)))
@@ -731,38 +794,35 @@ of QUERY-NAME."
     (aio-await (aio-url-retrieve (format leetcode--url-submit slug-title)))))
 
 (aio-defun leetcode--api-check-submission (interpret-id problem on-success)
-  "Polling problem with PROBLEM-ID submission by INTERPRET-ID.
-When check submission success, execute ON-SUCCESS. Both
-`leetcode-try' and `leetcode-submit' rely on this to poll
-submission status."
-  (message "LeetCode check submission: %s" (format leetcode--url-check-submission interpret-id))
+  "Poll the submission INTERPRET-ID until it succeeds or retries run out.
+On success, call ON-SUCCESS with the problem id and result alist."
+  (message "LeetCode check submission: %s"
+           (format leetcode--url-check-submission interpret-id))
   (let* ((title-slug (leetcode-problem-title-slug problem))
-         (problem-id (leetcode-problem-id problem))
-         (max-retries 50)                    ; 50 polls x 0.2s sleep + request latency
-         (retry-times 0)
-         (result nil))
-    (while (and (not (equal (alist-get 'state result) "SUCCESS"))
-                (< retry-times max-retries))
-      (let* ((url-request-method "GET")
-             (url-request-extra-headers `(,@(aio-await (leetcode--common-extra-headers))
-                                          ,(leetcode--referer (format leetcode--url-problems title-slug))))
-             (response (aio-await (aio-url-retrieve (format leetcode--url-check-submission interpret-id))))
-             (response-status (car response))
-             (response-buffer (cdr response)))
-        (if (plist-get response-status :error)
-            (progn
-              (switch-to-buffer response-buffer)
-              (leetcode--warn "LeetCode check submission ERROR: %S"
-                              (plist-get response-status :error))
-              (setq retry-times max-retries))
-          (setq result (condition-case nil
-                           (leetcode--parse-buffer response-buffer)
-                         (error result)))
-          (kill-buffer response-buffer)))
-      (aio-await (aio-sleep 0.2))
-      (setq retry-times (1+ retry-times)))
-    (if (equal (alist-get 'state result) "SUCCESS")
-        (funcall on-success problem-id result)
+         (result 'retry))
+    (catch 'done
+      (dotimes (_ 20)                        ; 20 polls x 0.5s sleep + request latency
+        (let* ((url-request-method "GET")
+               (url-request-extra-headers
+                `(,@(aio-await (leetcode--common-extra-headers))
+                  ,(leetcode--referer (format leetcode--url-problems title-slug))))
+               (response (aio-await (aio-url-retrieve
+                                     (format leetcode--url-check-submission interpret-id))))
+               (response-buffer (cdr response)))
+          (if (plist-get (car response) :error)
+              (progn
+                (switch-to-buffer response-buffer)
+                (leetcode--warn "LeetCode check submission ERROR: %S"
+                                (plist-get (car response) :error))
+                (throw 'done nil))
+            (setq result (condition-case nil
+                             (leetcode--parse-buffer response-buffer)
+                           (error 'retry)))
+            (kill-buffer response-buffer)))
+        (when (equal (alist-get 'state result) "SUCCESS")
+          (throw 'done (funcall on-success
+                                (leetcode-problem-id problem) result)))
+        (aio-await (aio-sleep 0.5)))
       (leetcode--warn "LeetCode check submission timeout."))))
 
 
@@ -784,7 +844,7 @@ Return a list of rows, each row is a vector:
   (let ((problems (leetcode-problems-problems leetcode--problems))
         rows)
     (dolist (p problems (reverse rows))
-      (if (or leetcode--display-paid (not (leetcode-problem-paid-only p)))
+      (if (or leetcode-display-paid (not (leetcode-problem-paid-only p)))
           (let* ((p-status (if (equal (leetcode-problem-status p) "SOLVED")
                                (leetcode--add-font-lock leetcode--checkmark 'leetcode-checkmark-face)
                              (string-width leetcode--checkmark)
@@ -820,6 +880,61 @@ Return a list of rows, each row is a vector:
             (string-equal-ignore-case difficulty leetcode--filter-difficulty))
         t)))
    rows))
+
+
+(defun leetcode--random-filter-to-string (filter)
+  "Serialize FILTER, a (DIFFICULTY STATUS TAGS) list, to a prompt string.
+Tags are comma-joined and omitted when nil."
+  (let ((difficulty (nth 0 filter))
+        (status (nth 1 filter))
+        (tags (nth 2 filter)))
+    (string-join (if tags
+                     (list difficulty status (string-join tags ","))
+                   (list difficulty status))
+                 " ")))
+
+(defun leetcode--random-parse-difficulty (token)
+  "Canonicalize difficulty TOKEN to lowercase, or nil if unrecognized."
+  (when token
+    (let ((candidates (append leetcode--all-difficulties '("all"))))
+      (downcase (seq-find (lambda (cand) (string-equal-ignore-case cand token))
+                          candidates)))))
+
+(defun leetcode--random-parse-filter (input)
+  "Parse INPUT, a \"[difficulty] [unsolved|all] [tag,tag,...]\" line.
+Return a (DIFFICULTY STATUS TAGS) list.  Missing or unrecognized
+tokens fall back to the previous filter
+\(`leetcode-random-filter')."
+  (let* ((prev leetcode-random-filter)
+         (tokens (split-string input nil t))
+         (difficulty (leetcode--random-parse-difficulty (nth 0 tokens)))
+         (status (when (nth 1 tokens)
+                   (let ((down (downcase (nth 1 tokens))))
+                     (when (member down '("unsolved" "all"))
+                       down))))
+         (tag-tokens (seq-mapcat (lambda (token)
+                                   (split-string token "," t))
+                                 (nthcdr 2 tokens))))
+    (list (or difficulty (nth 0 prev))
+          (or status (nth 1 prev))
+          (if (null (nthcdr 2 tokens))
+              (nth 2 prev)
+            tag-tokens))))
+
+(defun leetcode--random-filter-problems (problems difficulty status tags)
+  "Return members of PROBLEMS matching DIFFICULTY, STATUS and TAGS (OR semantics).
+DIFFICULTY and STATUS are lowercase strings (\"all\" means no
+restriction)."
+  (seq-filter
+   (lambda (p)
+     (and (or leetcode-display-paid (not (leetcode-problem-paid-only p)))
+          (or (string= difficulty "all")
+              (string-equal-ignore-case (leetcode-problem-difficulty p) difficulty))
+          (or (string= status "all")
+              (not (equal (leetcode-problem-status p) "SOLVED")))
+          (or (null tags)
+              (seq-some (lambda (tag) (member tag (leetcode-problem-tags p))) tags))))
+   problems))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; User Command ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -866,9 +981,9 @@ Return a list of rows, each row is a vector:
   (leetcode-refresh))
 
 (defun leetcode-toggle-paid-display ()
-  "Toggle `leetcode--display-paid` and refresh."
+  "Toggle `leetcode-display-paid' and refresh."
   (interactive)
-  (setq leetcode--display-paid (not leetcode--display-paid))
+  (setq leetcode-display-paid (not leetcode-display-paid))
   (leetcode-refresh))
 
 (defun leetcode--make-tabulated-headers (header-names rows)
@@ -993,14 +1108,88 @@ row."
         (let ((qid .data.activeDailyCodingChallengeQuestion.question.qid))
           (leetcode-show-problem qid))))))
 
+(aio-defun leetcode--random-page (skip)
+  "Fetch problem page at SKIP without touching list state.
+Update `leetcode--random-total-problems' from the response's
+totalLength and return the page's problems."
+  (let ((page (aio-await (leetcode--fetch-question-page "all-code-essentials"
+                                                        skip leetcode--random-page-size
+                                                        '((filterCombineType . "ALL"))
+                                                        ""
+                                                        '((sortField . "CUSTOM")
+                                                          (sortOrder . "ASCENDING"))))))
+    (setq leetcode--random-total-problems (cdr page))
+    (car page)))
+
+(aio-defun leetcode--random-pick (difficulty status tags)
+  "Return a random problem matching DIFFICULTY, STATUS and TAGS, or nil.
+Tries up to 4 random pages of the problem set, filtering each
+locally."
+  (let ((tried-skips ())
+        (pick nil))
+    (while (and (null pick)
+                (< (length tried-skips) 4)
+                ;; A stale-high cache can overestimate the page count; stop
+                ;; once every pickable page has been tried.
+                (< (length tried-skips)
+                   (ceiling leetcode--random-total-problems leetcode--random-page-size)))
+      (let* ((page-size leetcode--random-page-size)
+             (page-count (ceiling leetcode--random-total-problems page-size))
+             (skip (* page-size (random page-count))))
+        (unless (memq skip tried-skips)
+          (push skip tried-skips)
+          (let* ((problems (aio-await (leetcode--random-page skip)))
+                 (candidates (leetcode--random-filter-problems problems difficulty status tags)))
+            (when candidates
+              (setq pick (nth (random (length candidates)) candidates)))))))
+    pick))
+
+;;;###autoload(autoload 'leetcode-random "leetcode" nil t)
+(aio-defun leetcode-random (&optional arg)
+  "Pick a random problem matching a filter and start solving it.
+
+With plain \\[universal-argument] ARG, prompt once for the filter:
+\"[difficulty] [unsolved|all] [tag,tag,...]\" — e.g.
+\"medium unsolved array,hash-table\".  Bare RET keeps the previous
+filter.  Otherwise pick immediately using `leetcode-random-filter'.  Tags are OR semantics.
+
+Picks a random page of the problem set (page count derived from
+`leetcode--random-total-problems', seeded by the first response),
+filters it locally, then picks within the page; retries other
+random pages when the filter matches nothing.
+
+The picked problem opens in the coding layout with the code buffer
+selected; the problem description is not shown."
+  (interactive "P")
+  (let* ((filter (if arg
+                     (leetcode--random-parse-filter
+                      (read-from-minibuffer
+                       "Random filter [difficulty unsolved|all tag,tag]: "
+                       (leetcode--random-filter-to-string leetcode-random-filter)))
+                   leetcode-random-filter))
+         (pick (progn
+                 (aio-await (leetcode--ensure-login))
+                 (aio-await (leetcode--random-pick (nth 0 filter) (nth 1 filter) (nth 2 filter))))))
+    (if (null pick)
+        (message "No problems match: %s %s %s"
+                 (nth 0 filter) (nth 1 filter) (string-join (nth 2 filter) ","))
+      (unless (equal filter leetcode-random-filter)
+        (customize-save-variable 'leetcode-random-filter filter))
+      ;; Downstream lookups (`leetcode--get-problem-by-id') require the
+      ;; problem to be registered in `leetcode--problems'.
+      (cl-pushnew pick (leetcode-problems-problems leetcode--problems)
+                  :test (lambda (a b) (equal (leetcode-problem-title-slug a)
+                                             (leetcode-problem-title-slug b))))
+      (let ((problem-id (leetcode-problem-id pick)))
+        (leetcode--cleanup-other-problems problem-id)
+        (leetcode-show-problem problem-id)))))
+
 (aio-defun leetcode-try ()
   "Asynchronously test the code using customized testcase."
   (interactive)
   (leetcode-restore-layout)
   (aio-await (leetcode--ensure-login t))
-  (let* ((title-slug (leetcode--get-slug-title (current-buffer)))
-         (problem (leetcode--get-problem title-slug))
-         (problem-id (leetcode-problem-id problem))
+  (let* ((problem (leetcode--get-problem-by-id leetcode--problem-id))
          (interpret-id (aio-await (leetcode--api-interpret-solution problem))))
     (aio-await (leetcode--api-check-submission interpret-id problem #'leetcode--show-testcases-result))))
 
@@ -1009,12 +1198,10 @@ row."
   (interactive)
   (leetcode-restore-layout)
   (aio-await (leetcode--ensure-login t))
-  (let* ((code-buf (current-buffer))
-         (code (leetcode--code-buffer-data))
-         (slug-title (leetcode--get-slug-title code-buf))
-         (problem (leetcode--get-problem slug-title))
-         (problem-id (leetcode-problem-id problem))
+  (let* ((problem (leetcode--get-problem-by-id leetcode--problem-id))
+         (slug-title (leetcode-problem-title-slug problem))
          (backend-id (leetcode-problem-backend-id problem))
+         (code (leetcode--code-buffer-data))
          (response (aio-await (leetcode--api-submit backend-id slug-title code)))
          (response-status (car response))
          (response-buffer (cdr response)))
@@ -1093,48 +1280,53 @@ alist specified in `display-buffer-alist'."
 (defun leetcode--show-testcases-result (problem-id result)
   "Show testcases RESULT by PROBLEM-ID."
   (let-alist result
-    (with-current-buffer (get-buffer (leetcode--result-buffer-name problem-id))
-      (erase-buffer)
-      (goto-char (point-max))
-      (cond
-       ((eq .status_code 10)
-        (if (equal .code_answer .expected_code_answer)
-            (insert (leetcode--add-font-lock "PASS: " 'leetcode-accepted-face))
-          (insert (leetcode--add-font-lock "FAIL: " 'leetcode-error-face)))
-        (insert "\n\n")
-        ;; Code Answer
-        (insert "Code Answer:\n")
-        (dotimes (i (length .code_answer))
-          (insert (format "%s\n" (aref .code_answer i))))
-        (insert "\n")
-        ;; Expected
-        (insert "Expected Code Answer:\n")
-        (dotimes (i (length .expected_code_answer))
-          (insert (format "%s\n" (aref .expected_code_answer i))))
-        (insert "\n")
-        ;; Std output
-        (when (seq-find (lambda (s) (not (string-empty-p s))) .std_output_list)
-          (insert "Std Output:\n")
-          (dotimes (i (length .std_output_list))
-            (when (aref .std_output_list i)
-              (insert (aref .std_output_list i))))))
-       ((or (eq .status_code 12) (eq .status_code 14))
-        (insert (format "Status: %s\n\n"
-                        (leetcode--add-font-lock
-                         (format "%s (%s/%s)" .status_msg .total_correct .total_testcases)
-                         'leetcode-error-face)))
-        (insert (format "Test Case: \n%s\n\n" .last_testcase))
-        (insert (format "Expected Answer: %s\n\n" .expected_output))
-        (unless (string-empty-p .std_output)
-          (insert (format "Stdout: \n%s\n" .std_output))))
-       ((eq .status_code 15)
-        (insert (leetcode--add-font-lock .status_msg 'leetcode-error-face))
-        (insert "\n\n")
-        (insert .full_runtime_error))
-       ((eq .status_code 20)
-        (insert (leetcode--add-font-lock .status_msg 'leetcode-error-face))
-        (insert "\n\n")
-        (insert .full_compile_error))))))
+    ;; The result buffer may be gone if the problem was cleaned up while
+    ;; the request was in flight.
+    (when-let* ((buf (get-buffer (leetcode--result-buffer-name problem-id))))
+      (with-current-buffer buf
+        (erase-buffer)
+        (goto-char (point-max))
+        (cond
+         ((eq .status_code 10)
+          (if (equal .code_answer .expected_code_answer)
+              (insert (leetcode--add-font-lock "PASS: " 'leetcode-accepted-face))
+            (insert (leetcode--add-font-lock "FAIL: " 'leetcode-error-face)))
+          (insert "\n\n")
+          ;; Code Answer
+          (insert "Code Answer:")
+          (dotimes (i (length .code_answer))
+            (insert (format "\n%s" (aref .code_answer i))))
+          (insert "\n")
+          ;; Expected
+          (insert "Expected Code Answer:")
+          (dotimes (i (length .expected_code_answer))
+            (insert (format "\n%s" (aref .expected_code_answer i))))
+          (insert "\n")
+          ;; Std output
+          (when (seq-find (lambda (s) (not (string-empty-p s))) .std_output_list)
+            (insert "Std Output:\n")
+            (dotimes (i (length .std_output_list))
+              (when (and (aref .std_output_list i)
+                         (not (string-empty-p (aref .std_output_list i))))
+                (insert (leetcode--format-testcase-with-number
+                         (aref .std_output_list i) i))))))
+         ((or (eq .status_code 12) (eq .status_code 14))
+          (insert (format "Status: %s\n\n"
+                          (leetcode--add-font-lock
+                           (format "%s (%s/%s)" .status_msg .total_correct .total_testcases)
+                           'leetcode-error-face)))
+          (insert (format "Test Case: \n%s\n\n" .last_testcase))
+          (insert (format "Expected Answer: %s\n\n" .expected_output))
+          (unless (string-empty-p .std_output)
+            (insert (format "Stdout: \n%s\n" .std_output))))
+         ((eq .status_code 15)
+          (insert (leetcode--add-font-lock .status_msg 'leetcode-error-face))
+          (insert "\n\n")
+          (insert .full_runtime_error))
+         ((eq .status_code 20)
+          (insert (leetcode--add-font-lock .status_msg 'leetcode-error-face))
+          (insert "\n\n")
+          (insert .full_compile_error)))))))
 
 (defun leetcode--show-submission-result (problem-id result)
   "Show error info in `leetcode--result-buffer-name' by PROBLEM-ID.
@@ -1155,43 +1347,43 @@ STATUS_CODE has following possible value:
       (font-lock-mode +1)
       (cond
        ((eq .status_code 10)
-        (insert (format "Status: %s\n\n"
+        (insert (format "Status: %s\n"
                         (leetcode--add-font-lock
                          (format "%s (%s/%s)" .status_msg .total_correct .total_testcases)
                          'leetcode-accepted-face)))
-        (insert (format "Runtime: %s, faster than %.2f%% of %s submissions.\n\n"
+        (insert (format "Runtime: %s, faster than %.2f%% of %s submissions.\n"
                         .status_runtime .runtime_percentile .pretty_lang))
         (insert (format "Memory Usage: %s, less than %.2f%% of %s submissions."
                         .status_memory .memory_percentile .pretty_lang)))
        ((eq .status_code 11)
-        (insert (format "Status: %s\n\n"
+        (insert (format "Status: %s\n"
                         (leetcode--add-font-lock
                          (format "%s (%s/%s)" .status_msg .total_correct .total_testcases)
                          'leetcode-error-face)))
-        (insert (format "Test Case: \n%s\n\n" .input))
-        (insert (format "Answer: %s\n\n" .code_output))
-        (insert (format "Expected Answer: %s\n\n" .expected_output))
+        (insert (format "Test Case: \n%s\n" .input))
+        (insert (format "Answer: %s\n" .code_output))
+        (insert (format "Expected Answer: %s\n" .expected_output))
         (unless (string-empty-p .std_output)
           (insert (format "Stdout: \n%s\n" .std_output))))
        ((eq .status_code 12)
         (insert (format "Status: %s" (leetcode--add-font-lock .status_msg 'leetcode-error-face)))
-        (insert (format "\n\n%s / %s testcases passed\n" .total_correct .total_testcases))
+        (insert (format "\n%s / %s testcases passed\n" .total_correct .total_testcases))
         (insert (format "Last Test Case: %s\n" .last_testcase)))
        ((eq .status_code 13)
         (insert (format "Status: %s" (leetcode--add-font-lock .status_msg 'leetcode-error-face))))
        ((eq .status_code 14)
         (insert (format "Status: %s" (leetcode--add-font-lock .status_msg 'leetcode-error-face)))
-        (insert (format "\n\n%s / %s testcases passed\n" .total_correct .total_testcases))
+        (insert (format "\n%s / %s testcases passed\n" .total_correct .total_testcases))
         (insert (format "Last Test Case: %s\n" .last_testcase)))
        ((eq .status_code 15)
         (insert (format "Status: %s" (leetcode--add-font-lock .status_msg 'leetcode-error-face)))
-        (insert (format "\n\n%s / %s testcases passed\n" .total_correct .total_testcases))
+        (insert (format "\n%s / %s testcases passed\n" .total_correct .total_testcases))
         (insert (format "Last Test Case: %s\n" .last_testcase))
-        (insert "\n\n")
+        (insert "\n")
         (insert (format .full_runtime_error)))
        ((eq .status_code 20)
         (insert (format "Status: %s" (leetcode--add-font-lock .status_msg 'leetcode-error-face)))
-        (insert "\n\n")
+        (insert "\n")
         (insert (format .full_compile_error))))
       (display-buffer (current-buffer)
                       '((display-buffer-reuse-window
@@ -1211,7 +1403,6 @@ will show the detail in other window and jump to it."
          (buf-name (leetcode--detail-buffer-name problem-id))
          (html-margin "&nbsp;&nbsp;&nbsp;&nbsp;"))
     (leetcode--debug "select title: %s" title)
-    (leetcode--maybe-focus)
     ;; Kill defail buffer if exists, we'll re-create a new one.
     (when (get-buffer buf-name) (kill-buffer buf-name))
     ;; Render question with `shr'.
@@ -1246,7 +1437,8 @@ will show the detail in other window and jump to it."
       (rename-buffer buf-name)
       (leetcode--problem-detail-mode)
       (switch-to-buffer (current-buffer))
-      (search-backward "Solve it"))))
+      (search-backward "Solve it"))
+    (leetcode--maybe-focus)))
 
 (aio-defun leetcode-show-problem (problem-id)
   "Show the detail of problem with id PROBLEM-ID.
@@ -1257,7 +1449,6 @@ to it."
                                   (when (derived-mode-p 'leetcode--problems-mode)
                                     (leetcode--get-current-problem-id)))))
   (let* ((problem (leetcode--get-problem-by-id problem-id))
-         (title-slug (leetcode-problem-title-slug problem))
          (problem-with-title (aio-await (leetcode--ensure-question-title problem)))
          (problem-with-content (aio-await (leetcode--ensure-question-content problem)))
          (problem-with-testcases (aio-await (leetcode--ensure-question-testcases problem)))
@@ -1304,7 +1495,7 @@ Problems'."
 
 (defun leetcode-show-problem-in-browser (problem-id)
   "Open the problem with id PROBLEM-ID in browser."
-  (interactive (list (read-number "Show in browser by problem id: "
+  (interactive (list (read-string "Show in browser by problem id: "
                                   (leetcode--get-current-problem-id))))
   (let* ((problem (leetcode--get-problem-by-id problem-id))
          (title (leetcode-problem-title problem))
@@ -1320,11 +1511,10 @@ Call `leetcode-show-problem-in-browser' on the current problem id."
 
 (aio-defun leetcode-solve-problem (problem-id)
   "Start coding the problem with id PROBLEM-ID."
-  (interactive (list (read-number "Solve the problem with id: "
+  (interactive (list (read-string "Solve the problem with id: "
                                   (leetcode--get-current-problem-id))))
-  (let* ((problem (leetcode--get-problem-by-id problem-id)))
-    (leetcode--show-problem problem)
-    (leetcode--start-coding problem)))
+  (aio-await (leetcode-show-problem problem-id))
+  (leetcode--start-coding (leetcode--get-problem-by-id problem-id)))
 
 (defun leetcode-solve-current-problem ()
   "Start coding the current problem.
@@ -1341,6 +1531,40 @@ Call `leetcode-solve-problem' on the current problem id."
   (when buf
     (delete-windows-on buf t)
     (kill-buffer buf)))
+
+(defun leetcode--cleanup-problem-by-id (problem-id)
+  "Kill the code/detail/result/testcase buffers of problem with id PROBLEM-ID.
+Save a modified solution file buffer before killing it; remove the
+problem from `leetcode--problem-titles'."
+  (let* ((problem (leetcode--get-problem-by-id problem-id))
+         (title (when problem (leetcode-problem-title problem))))
+    ;; Code buffer first: it holds the user's solution; save it before killing.
+    ;; Skip when the code buffer is the one being killed (hook re-entry).
+    (let ((code-buffer (when title (get-buffer (leetcode--get-code-buffer-name title)))))
+      (when (and code-buffer (not (eq code-buffer (current-buffer))))
+        (with-current-buffer code-buffer
+          (when (and buffer-file-name (buffer-modified-p))
+            (save-buffer)))
+        (leetcode--kill-buff-and-delete-window code-buffer)))
+    (leetcode--kill-buff-and-delete-window
+     (get-buffer (leetcode--detail-buffer-name problem-id)))
+    (leetcode--kill-buff-and-delete-window
+     (get-buffer (leetcode--result-buffer-name problem-id)))
+    (leetcode--kill-buff-and-delete-window
+     (get-buffer (leetcode--testcase-buffer-name problem-id)))
+    (setq leetcode--problem-titles (remove title leetcode--problem-titles))))
+
+(defun leetcode--cleanup-other-problems (problem-id)
+  "Clean up buffers of open problems other than PROBLEM-ID."
+  (dolist (title leetcode--problem-titles)
+    (let ((other (leetcode--get-problem (leetcode--slugify-title title))))
+      (when (and other (not (equal (leetcode-problem-id other) problem-id)))
+        (leetcode--cleanup-problem-by-id (leetcode-problem-id other))))))
+
+(defun leetcode--cleanup-on-kill ()
+  "Clean up the current problem when its code buffer is killed."
+  (when leetcode--problem-id
+    (leetcode--cleanup-problem-by-id leetcode--problem-id)))
 
 (defun leetcode-quit ()
   "Close and delete leetcode related buffers and windows."
@@ -1423,6 +1647,9 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
          (testcase-buf-name (leetcode--testcase-buffer-name problem-id))
          (result-buf-name (leetcode--result-buffer-name problem-id)))
 
+    ;; Clean up the previous problem's buffers by default.
+    (leetcode--cleanup-other-problems problem-id)
+
     ;; Record windows opened for later cleanup.
     (unless (member title leetcode--problem-titles)
       (push title leetcode--problem-titles))
@@ -1442,12 +1669,17 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
                                       (equal (leetcode-snippet-lang-slug s) leetcode--lang))
                                     snippets))
                  (template-code (leetcode-snippet-code snippet)))
+            (let ((header (alist-get leetcode--lang leetcode-buffer-header nil nil #'equal)))
+              (when header
+                (insert header)))
             (leetcode--insert-code-start-marker)
             (insert template-code)
             (leetcode--insert-code-end-marker)
             (leetcode--replace-in-buffer "" "")))
         (funcall (assoc-default suffix auto-mode-alist #'string-match-p))
-        (leetcode-solution-mode t))
+        (leetcode-solution-mode t)
+        ;; After the major mode's `kill-all-local-variables'.
+        (setq-local leetcode--problem-id problem-id))
 
       (display-buffer code-buf
                       '((display-buffer-reuse-window
@@ -1457,7 +1689,10 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
     ;; Setup testcase buffer
     (with-current-buffer (get-buffer-create testcase-buf-name)
       (erase-buffer)
-      (insert (s-join "\n" testcases))
+      (insert (s-join "\n"
+                      (seq-map-indexed (lambda (testcase index)
+                                         (leetcode--format-testcase-with-number testcase index))
+                                       testcases)))
       (set-window-buffer leetcode--testcase-window (current-buffer)))
     (with-current-buffer (get-buffer-create result-buf-name)
       (erase-buffer)
@@ -1465,11 +1700,9 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
 
 (aio-defun leetcode-restore-layout ()
   "This command should be run in LeetCode code buffer.
-It will restore the layout based on current buffer's name."
+It will restore the layout based on current buffer's problem id."
   (interactive)
-  (let* ((slug-title (leetcode--get-slug-title (current-buffer)))
-         (problem (leetcode--get-problem slug-title))
-         (problem-id (leetcode-problem-id problem))
+  (let* ((problem-id leetcode--problem-id)
          (desc-buf (get-buffer (leetcode--detail-buffer-name problem-id)))
          (testcase-buf (get-buffer-create (leetcode--testcase-buffer-name problem-id)))
          (result-buf (get-buffer-create (leetcode--result-buffer-name problem-id))))
@@ -1516,6 +1749,7 @@ It will restore the layout based on current buffer's name."
       (define-key map "d" #'leetcode-set-filter-difficulty)
       (define-key map "g" #'leetcode-refresh)
       (define-key map "G" #'leetcode-refresh-fetch)
+      (define-key map "R" #'leetcode-random)
       (define-key map "r" #'leetcode-reset-filter-and-refresh)
       (define-key map "q" #'quit-window)))
   "Keymap for `leetcode--problems-mode'.")
@@ -1571,7 +1805,8 @@ It will restore the layout based on current buffer's name."
     (prog1 map
       (define-key map (kbd "C-c C-t") #'leetcode-try)
       (define-key map (kbd "C-c C-s") #'leetcode-submit)
-      (define-key map (kbd "C-c C-r") #'leetcode-restore-layout)))
+      (define-key map (kbd "C-c C-r") #'leetcode-random)
+      (define-key map (kbd "C-c C-l") #'leetcode-restore-layout)))
   "Keymap for `leetcode-solution-mode'.")
 
 (define-minor-mode leetcode-solution-mode
@@ -1579,7 +1814,10 @@ It will restore the layout based on current buffer's name."
   :require 'leetcode
   :lighter " LC-Solution"
   :group 'leetcode
-  :keymap leetcode-solution-mode-map)
+  :keymap leetcode-solution-mode-map
+  (if leetcode-solution-mode
+      (add-hook 'kill-buffer-hook #'leetcode--cleanup-on-kill nil t)
+    (remove-hook 'kill-buffer-hook #'leetcode--cleanup-on-kill t)))
 
 (provide 'leetcode)
 ;;; leetcode.el ends here
