@@ -242,8 +242,10 @@ in 'leetcode.el'."
 (defvar leetcode--problem-titles nil
   "Problem titles that have been open in solving layout.")
 
-(defvar-local leetcode--problem-id nil
-  "Buffer-local problem id in a LeetCode code buffer.")
+(defvar leetcode--problem-id nil
+  "Problem id being viewed or solved in the current perspective.")
+
+(persp-make-variable-persp-local 'leetcode--problem-id)
 
 (defvar leetcode--display-tags leetcode-prefer-tag-display
   "(Internal) Whether tags are displayed the *leetcode* buffer.")
@@ -257,9 +259,6 @@ Also gates `leetcode-random': when nil, random picks free problems only."
 (defvar leetcode--lang leetcode-prefer-language
   "LeetCode programming language or sql for current problem internally.
 Default is programming language.")
-
-(defvar leetcode--description-window nil
-  "(Internal) Holds the reference to description window.")
 
 (defvar leetcode--testcase-window nil
   "(Internal) Holds the reference to testcase window.")
@@ -555,6 +554,27 @@ Such as 'Two Sum' will be converted to 'two-sum'. 'Pow(x, n)' will be 'powx-n'"
 (defun leetcode--result-buffer-name (problem-id)
   "Result buffer name with PROBLEM-ID."
   (format "*leetcode-result-%s*" problem-id))
+
+(defun leetcode--run-in-persp (persp thunk)
+  "Run THUNK in perspective PERSP.
+If PERSP is current, call THUNK immediately; otherwise call it the next
+time the user switches to PERSP.  Never switches perspectives."
+  (if (equal persp (persp-current-name))
+      (funcall thunk)
+    (message "LeetCode ready in perspective %s; switch there to view." persp)
+    (letrec ((run (lambda ()
+                    (when (equal persp (persp-current-name))
+                      (remove-hook 'persp-switch-hook run)
+                      (funcall thunk)))))
+      (add-hook 'persp-switch-hook run))))
+
+(defmacro leetcode--display-in-persp (persp &rest body)
+  "Display BODY in perspective PERSP.
+BODY runs immediately if PERSP is current, otherwise the next time the
+user switches to PERSP.  Never switches perspectives, so it never
+intrudes on the perspective the user moved to."
+  (declare (indent 1))
+  `(leetcode--run-in-persp ,persp (lambda () ,@body)))
 
 (defun leetcode--maybe-focus ()
   "Delete other windows, keep only *leetcode* buffer."
@@ -1160,32 +1180,34 @@ a page per refresh."
   "Start Leetcode."
   (interactive)
   (when (leetcode--check-deps)
-    (if (get-buffer leetcode--buffer-name)
+    (let ((persp-name (persp-current-name)))
+      (unless (get-buffer leetcode--buffer-name)
+        (aio-await (leetcode--ensure-login))
+        (unless (leetcode--load-problems-cache)
+          (aio-await (leetcode-refresh-fetch)))
+        (leetcode-refresh))
+      (leetcode--display-in-persp persp-name
         (switch-to-buffer leetcode--buffer-name)
-      (aio-await (leetcode--ensure-login))
-      (unless (leetcode--load-problems-cache)
-        (aio-await (leetcode-refresh-fetch)))
-      (switch-to-buffer leetcode--buffer-name)
-      (leetcode-refresh))
-    (leetcode--maybe-focus)))
+        (leetcode--maybe-focus)))))
 
 ;;;###autoload(autoload 'leetcode-daily "leetcode" nil t)
 (aio-defun leetcode-daily ()
   "Open the daily challenge."
   (interactive)
-  (aio-await (leetcode--ensure-login))
-  (let* ((url-request-method "POST")
-         (url-request-extra-headers `(,@(aio-await (leetcode--common-extra-headers))
-                                      ,(leetcode--referer leetcode--url-login)))
-         (url-request-data
-          (json-encode
-           `((operationName . "questionOfToday")
-             (query . ,leetcode--url-daily-challenge)))))
-    (with-current-buffer (url-retrieve-synchronously leetcode--url-graphql)
-      (goto-char url-http-end-of-headers)
-      (let-alist (json-read)
-        (let ((qid .data.activeDailyCodingChallengeQuestion.question.qid))
-          (leetcode-show-problem qid))))))
+  (let ((persp-name (persp-current-name)))
+    (aio-await (leetcode--ensure-login))
+    (let* ((url-request-method "POST")
+           (url-request-extra-headers `(,@(aio-await (leetcode--common-extra-headers))
+                                        ,(leetcode--referer leetcode--url-login)))
+           (url-request-data
+            (json-encode
+             `((operationName . "questionOfToday")
+               (query . ,leetcode--url-daily-challenge)))))
+      (with-current-buffer (url-retrieve-synchronously leetcode--url-graphql)
+        (goto-char url-http-end-of-headers)
+        (let-alist (json-read)
+          (let ((qid .data.activeDailyCodingChallengeQuestion.question.qid))
+            (leetcode-show-problem qid persp-name)))))))
 
 (aio-defun leetcode--random-page (skip)
   "Fetch problem page at SKIP without touching list state.
@@ -1264,7 +1286,8 @@ random pages when the filter matches nothing.
 The picked problem opens in the coding layout with the code buffer
 selected; the problem description is not shown."
   (interactive "P")
-  (let* ((filter (if arg
+  (let* ((persp-name (persp-current-name))
+         (filter (if arg
                      (leetcode--random-parse-filter
                       (read-from-minibuffer
                        "Random filter [difficulty unsolved|all tag,tag]: "
@@ -1283,9 +1306,11 @@ selected; the problem description is not shown."
       (cl-pushnew pick (leetcode-problems-problems leetcode--problems)
                   :test (lambda (a b) (equal (leetcode-problem-id a)
                                              (leetcode-problem-id b))))
-      (let ((problem-id (leetcode-problem-id pick)))
-        (leetcode--cleanup-other-problems problem-id)
-        (leetcode-show-problem problem-id)))))
+      (let* ((problem-id (leetcode-problem-id pick))
+             (problem (aio-await (leetcode--ensure-problem-detail problem-id))))
+        (leetcode--display-in-persp persp-name
+          (leetcode--cleanup-other-problems problem-id)
+          (leetcode--show-problem problem))))))
 
 (aio-defun leetcode-try ()
   "Asynchronously test the code using customized testcase."
@@ -1317,42 +1342,22 @@ selected; the problem description is not shown."
 (defun leetcode--solving-window-layout ()
   "Specify layout for solving problem.
 +---------------+----------------+
-|               |                |
-|               |     Detail     |
-|               |                |
-|               +----------------+
-|     Code      |   Customize    |
-|               |   Testcases    |
+|               |   Customize    |
+|     Code      |   Testcases    |
 |               +----------------+
 |               |Submit/Testcases|
 |               |    Result      |
 +---------------+----------------+"
   (delete-other-windows)
-  (setq leetcode--description-window (split-window-horizontally))
-  (other-window 1)
-  (setq leetcode--testcase-window (split-window-below))
+  (setq leetcode--testcase-window (split-window-horizontally))
   (other-window 1)
   (setq leetcode--result-window (split-window-below))
-  (other-window -1)
   (other-window -1))
 
 (defun leetcode--display-result (buffer &optional alist)
   "Display function for LeetCode result.
 BUFFER is used to show LeetCode result. ALIST is a combined alist
 specified in `display-buffer-alist'."
-  (let ((window (window-next-sibling
-                 (window-next-sibling
-                  (window-top-child
-                   (window-next-sibling
-                    (window-left-child
-                     (frame-root-window))))))))
-    (set-window-buffer window buffer)
-    window))
-
-(defun leetcode--display-testcase (buffer &optional alist)
-  "Display function for LeetCode testcase.
-BUFFER is used to show LeetCode testcase. ALIST is a combined
-alist specified in `display-buffer-alist'."
   (let ((window (window-next-sibling
                  (window-top-child
                   (window-next-sibling
@@ -1361,10 +1366,10 @@ alist specified in `display-buffer-alist'."
     (set-window-buffer window buffer)
     window))
 
-(defun leetcode--display-detail (buffer &optional alist)
-  "Display function for LeetCode detail.
-BUFFER is used to show LeetCode detail. ALIST is a combined alist
-specified in `display-buffer-alist'."
+(defun leetcode--display-testcase (buffer &optional alist)
+  "Display function for LeetCode testcase.
+BUFFER is used to show LeetCode testcase. ALIST is a combined
+alist specified in `display-buffer-alist'."
   (let ((window (window-top-child
                  (window-next-sibling
                   (window-left-child
@@ -1505,6 +1510,7 @@ will show the detail in other window and jump to it."
          (content (leetcode-problem-content problem))
          (buf-name (leetcode--detail-buffer-name problem-id))
          (html-margin "&nbsp;&nbsp;&nbsp;&nbsp;"))
+    (setq leetcode--problem-id problem-id)
     (leetcode--debug "select title: %s" title)
     ;; Kill defail buffer if exists, we'll re-create a new one.
     (when (get-buffer buf-name) (kill-buffer buf-name))
@@ -1543,20 +1549,33 @@ will show the detail in other window and jump to it."
       (search-backward "Solve it"))
     (leetcode--maybe-focus)))
 
-(aio-defun leetcode-show-problem (problem-id)
+(aio-defun leetcode--ensure-problem-detail (problem-id)
+  "Return problem PROBLEM-ID with title/content/testcases/snippets populated.
+Performs the network fetches, so the result can be rendered synchronously
+with `leetcode--show-problem'."
+  (let* ((problem (or (leetcode--get-problem-by-id problem-id)
+                      (aio-await (leetcode--fetch-question-by-id problem-id))))
+         (problem (aio-await (leetcode--ensure-question-title problem)))
+         (problem (aio-await (leetcode--ensure-question-content problem)))
+         (problem (aio-await (leetcode--ensure-question-testcases problem)))
+         (problem (aio-await (leetcode--ensure-question-snippets problem))))
+    problem))
+
+(aio-defun leetcode-show-problem (problem-id &optional persp-name)
   "Show the detail of problem with id PROBLEM-ID.
 Get problem by id and use `shr-render-buffer' to render problem
 detail. This action will show the detail in other window and jump
-to it."
+to it.
+
+PERSP-NAME is the perspective to display in (default: the one active
+now).  If the user has switched away by the time the problem is ready,
+defer with a message instead of intruding on the new perspective."
   (interactive (list (read-string "Show problem by problem id: "
                                   (leetcode--get-current-problem-id))))
-  (let* ((problem (or (leetcode--get-problem-by-id problem-id)
-                      (aio-await (leetcode--fetch-question-by-id problem-id))))
-         (problem-with-title (aio-await (leetcode--ensure-question-title problem)))
-         (problem-with-content (aio-await (leetcode--ensure-question-content problem)))
-         (problem-with-testcases (aio-await (leetcode--ensure-question-testcases problem)))
-         (problem-with-snippets (aio-await (leetcode--ensure-question-snippets problem))))
-    (leetcode--show-problem problem-with-snippets)))
+  (let* ((persp-name (or persp-name (persp-current-name)))
+         (problem (aio-await (leetcode--ensure-problem-detail problem-id))))
+    (leetcode--display-in-persp persp-name
+      (leetcode--show-problem problem))))
 
 (defun leetcode-show-problem-by-slug (slug-title)
   "Show the detail of problem with SLUG-TITLE.
@@ -1616,8 +1635,10 @@ Call `leetcode-show-problem-in-browser' on the current problem id."
   "Start coding the problem with id PROBLEM-ID."
   (interactive (list (read-string "Solve the problem with id: "
                                   (leetcode--get-current-problem-id))))
-  (aio-await (leetcode-show-problem problem-id))
-  (leetcode--start-coding (leetcode--get-problem-by-id problem-id)))
+  (let ((persp-name (persp-current-name)))
+    (aio-await (leetcode-show-problem problem-id persp-name))
+    (leetcode--display-in-persp persp-name
+      (leetcode--start-coding (leetcode--get-problem-by-id problem-id)))))
 
 (defun leetcode-solve-current-problem ()
   "Start coding the current problem.
@@ -1658,16 +1679,20 @@ problem from `leetcode--problem-titles'."
     (setq leetcode--problem-titles (remove title leetcode--problem-titles))))
 
 (defun leetcode--cleanup-other-problems (problem-id)
-  "Clean up buffers of open problems other than PROBLEM-ID."
-  (dolist (title leetcode--problem-titles)
-    (let ((other (leetcode--get-problem (leetcode--slugify-title title))))
-      (when (and other (not (equal (leetcode-problem-id other) problem-id)))
-        (leetcode--cleanup-problem-by-id (leetcode-problem-id other))))))
+  "Clean up this perspective's current problem unless it is PROBLEM-ID."
+  (when (and leetcode--problem-id
+             (not (equal leetcode--problem-id problem-id)))
+    (leetcode--cleanup-problem-by-id leetcode--problem-id)))
 
 (defun leetcode--cleanup-on-kill ()
   "Clean up the current problem when its code buffer is killed."
-  (when leetcode--problem-id
-    (leetcode--cleanup-problem-by-id leetcode--problem-id)))
+  (when (and leetcode--problem-id
+             (equal (buffer-name)
+                    (leetcode--get-code-buffer-name
+                     (leetcode-problem-title
+                      (leetcode--get-problem-by-id leetcode--problem-id)))))
+    (leetcode--cleanup-problem-by-id leetcode--problem-id)
+    (setq leetcode--problem-id nil)))
 
 (defun leetcode-quit ()
   "Close and delete leetcode related buffers and windows."
@@ -1788,8 +1813,7 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
             (leetcode--replace-in-buffer "" "")))
         (funcall (assoc-default suffix auto-mode-alist #'string-match-p))
         (leetcode-solution-mode t)
-        ;; After the major mode's `kill-all-local-variables'.
-        (setq-local leetcode--problem-id problem-id))
+        (setq leetcode--problem-id problem-id))
 
       (display-buffer code-buf
                       '((display-buffer-reuse-window
@@ -1813,19 +1837,12 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
 It will restore the layout based on current buffer's problem id."
   (interactive)
   (let* ((problem-id leetcode--problem-id)
-         (desc-buf (get-buffer (leetcode--detail-buffer-name problem-id)))
          (testcase-buf (get-buffer-create (leetcode--testcase-buffer-name problem-id)))
          (result-buf (get-buffer-create (leetcode--result-buffer-name problem-id))))
     (leetcode--solving-window-layout)
-    (unless desc-buf
-      (aio-await (leetcode-show-problem problem-id)))
     (with-current-buffer result-buf
       (erase-buffer)
       (insert "Waiting for result..."))
-    (display-buffer desc-buf
-                    '((display-buffer-reuse-window
-                       leetcode--display-detail)
-                      (reusable-frames . visible)))
     (display-buffer testcase-buf
                     '((display-buffer-reuse-window
                        leetcode--display-testcase)
