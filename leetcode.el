@@ -1687,14 +1687,19 @@ problem from `leetcode--problem-titles'."
 
 (defun leetcode--set-lang (snippets)
   "Set `leetcode--lang' based on langSlug in SNIPPETS."
-  (setq leetcode--lang
-        ;; if there is a mysql snippet, we use `leetcode-prefer-sql'.
-        (if (seq-find (lambda (s)
-                        (equal (leetcode-snippet-lang-slug s)
-                               leetcode-prefer-sql))
-                      snippets)
-            leetcode-prefer-sql
-          leetcode-prefer-language)))
+  (let ((has-lang (lambda (lang)
+                    (seq-find (lambda (s)
+                                (equal (leetcode-snippet-lang-slug s) lang))
+                              snippets))))
+    (setq leetcode--lang
+          (cond
+           ;; if there is a mysql snippet, we use `leetcode-prefer-sql'.
+           ((funcall has-lang leetcode-prefer-sql) leetcode-prefer-sql)
+           ((funcall has-lang leetcode-prefer-language) leetcode-prefer-language)
+           ;; the preferred language is not offered (e.g. shell/bash-only
+           ;; problems); fall back to the first available snippet's language.
+           ((car snippets) (leetcode-snippet-lang-slug (car snippets)))
+           (t leetcode-prefer-language)))))
 
 (defun leetcode--get-code-buffer-name (title)
   "Get code buffer name by TITLE and `leetcode-prefer-language'."
@@ -1891,6 +1896,7 @@ It will restore the layout based on current buffer's problem id."
   (let ((map (make-sparse-keymap)))
     (prog1 map
       (suppress-keymap map)
+      (define-key map (kbd "C-c C-r") #'leetcode-random)
       (define-key map "q" #'quit-window)))
   "Keymap for `leetcode--problem-detail-mode'.")
 
