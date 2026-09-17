@@ -621,6 +621,32 @@ Case-number label lines (\"case N:\") added on fill are stripped."
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; LeetCode API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(defconst leetcode--request-retry-delays '(0.5 0.5 1.0 1.0)
+  "Delays between retries for LeetCode request failures.")
+
+(aio-defun leetcode--retrieve-with-retry (url)
+  "Retrieve URL, retrying request failures twice."
+  (let ((retry-delays leetcode--request-retry-delays))
+    (catch 'complete
+      (while t
+        (let* ((result (aio-await (aio-catch (aio-url-retrieve url))))
+               (succeeded (eq (car result) :success))
+               (response (and succeeded (cdr result)))
+               (request-error (if succeeded
+                                  (plist-get (car response) :error)
+                                (cdr result))))
+          (if (and request-error retry-delays)
+              (let ((response-buffer (and response (cdr response)))
+                    (delay (pop retry-delays)))
+                (when (buffer-live-p response-buffer)
+                  (kill-buffer response-buffer))
+                (leetcode--warn "LeetCode request failed: %S; retrying in %.1fs"
+                                request-error delay)
+                (aio-await (aio-sleep delay)))
+            (if succeeded
+                (throw 'complete response)
+              (signal (car request-error) (cdr request-error)))))))))
+
 (defun leetcode--graphql-payload (operation query &optional vars)
   "Construct GraphQL request payload with OPERATION, QUERY or maybe VARS."
   (json-encode
@@ -655,7 +681,7 @@ of QUERY-NAME."
               (url-request-method "POST")
               (url-request-extra-headers `(,leetcode--User-Agent ,leetcode--Content-Type))
               (url-request-data payload)
-              (response (aio-await (aio-url-retrieve leetcode--url-graphql)))
+              (response (aio-await (leetcode--retrieve-with-retry leetcode--url-graphql)))
               (response-status (car response))
               (response-buffer (cdr response)))
          (if-let* ((error (plist-get response-status :error)))
@@ -901,7 +927,7 @@ On success, call ON-SUCCESS with the problem id and result alist."
                (url-request-extra-headers
                 `(,@(aio-await (leetcode--common-extra-headers))
                   ,(leetcode--referer (format leetcode--url-problems title-slug))))
-               (response (aio-await (aio-url-retrieve
+               (response (aio-await (leetcode--retrieve-with-retry
                                      (format leetcode--url-check-submission interpret-id))))
                (response-buffer (cdr response)))
           (if (plist-get (car response) :error)
